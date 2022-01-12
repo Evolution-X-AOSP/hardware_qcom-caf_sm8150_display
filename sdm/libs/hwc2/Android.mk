@@ -52,6 +52,8 @@ ifeq ($(TARGET_USES_FOD_ZPOS), true)
 LOCAL_CFLAGS                  += -DFOD_ZPOS
 endif
 
+LOCAL_SHARED_LIBRARIES        += libbinder_ndk android.hardware.power-V1-ndk_platform pixel-power-ext-V1-ndk_platform
+
 LOCAL_SRC_FILES               := hwc_session.cpp \
                                  hwc_session_services.cpp \
                                  hwc_display.cpp \
@@ -66,6 +68,7 @@ LOCAL_SRC_FILES               := hwc_session.cpp \
                                  hwc_layers.cpp \
                                  hwc_callbacks.cpp \
                                  cpuhint.cpp \
+                                 worker.cpp \
                                  hwc_tonemapper.cpp \
                                  display_null.cpp \
                                  hwc_socket_handler.cpp \
