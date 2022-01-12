@@ -44,6 +44,25 @@
 #include "hwc_display_event_handler.h"
 #include "hwc_buffer_sync_handler.h"
 #include <android/hardware/graphics/composer/2.4/IComposerClient.h>
+
+#include "worker.h"
+
+namespace aidl {
+namespace google {
+namespace hardware {
+namespace power {
+namespace extension {
+namespace pixel {
+
+class IPowerExt;
+
+} // namespace pixel
+} // namespace extension
+} // namespace power
+} // namespace hardware
+} // namespace google
+} // namespace aidl
+
 namespace sdm {
 using ::android::hardware::Return;
 using ::android::hardware::hidl_string;
@@ -240,7 +259,12 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   static Locker power_state_[HWCCallbacks::kNumDisplays];
   static Locker display_config_locker_;
 
+  protected:
+   void updateRefreshRateHint();
+
  private:
+
+  int32_t checkPowerHalExtHintSupport(const std::string& mode);
 
   class DisplayConfigImpl: public DisplayConfig::ConfigInterface {
    public:
@@ -453,6 +477,46 @@ class HWCSession : hwc2_device_t, HWCUEventListener, public qClient::BnQClient,
   bool async_powermode_ = false;
   bool power_state_transition_[HWCCallbacks::kNumDisplays] = {};  // +1 to account for primary.
   std::bitset<HWCCallbacks::kNumDisplays> display_ready_;
+
+  /* Display hint to notify power hal */
+  class PowerHalHintWorker : public Worker {
+  public:
+      PowerHalHintWorker();
+      void signalRefreshRate(HWC2::PowerMode powerMode, uint32_t vsyncPeriod);
+      void signalIdle();
+  protected:
+      void Routine() override;
+  private:
+      int32_t connectPowerHalExt();
+      int32_t checkPowerHalExtHintSupport(const std::string& mode);
+      int32_t sendPowerHalExtHint(const std::string& mode, bool enabled);
+      int32_t checkRefreshRateHintSupport(int refreshRate);
+      int32_t updateRefreshRateHintInternal(HWC2::PowerMode powerMode,
+                                            uint32_t vsyncPeriod);
+      int32_t sendRefreshRateHint(int refreshRate, bool enabled);
+      int32_t checkIdleHintSupport();
+      int32_t updateIdleHint(uint64_t deadlineTime);
+      bool mNeedUpdateRefreshRateHint;
+      // previous refresh rate
+      int mPrevRefreshRate;
+      // the refresh rate whose hint failed to be disabled
+      int mPendingPrevRefreshRate;
+      // support list of refresh rate hints
+      std::map<int, bool> mRefreshRateHintSupportMap;
+      bool mIdleHintIsEnabled;
+      uint64_t mIdleHintDeadlineTime;
+      // whether idle hint support is checked
+      bool mIdleHintSupportIsChecked;
+      // whether idle hint is supported
+      bool mIdleHintIsSupported;
+      HWC2::PowerMode mPowerModeState;
+      uint32_t mVsyncPeriod;
+      // for power HAL extension hints
+      std::shared_ptr<aidl::google::hardware::power::extension::pixel::IPowerExt>
+               mPowerHalExtAidl;
+  };
+      PowerHalHintWorker mPowerHalHint;
+
 };
 
 }  // namespace sdm
