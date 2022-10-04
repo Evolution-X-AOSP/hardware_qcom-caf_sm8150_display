@@ -52,7 +52,7 @@ ifeq ($(TARGET_USES_FOD_ZPOS), true)
 LOCAL_CFLAGS                  += -DFOD_ZPOS
 endif
 
-LOCAL_SHARED_LIBRARIES        += libbinder_ndk android.hardware.power-V1-ndk_platform pixel-power-ext-V1-ndk_platform
+LOCAL_SHARED_LIBRARIES        += libbinder_ndk android.hardware.power-V1-ndk pixel-power-ext-V1-ndk
 
 LOCAL_SRC_FILES               := hwc_session.cpp \
                                  hwc_session_services.cpp \
