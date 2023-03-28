@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2020, 2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2021, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -42,9 +42,12 @@
 #include <thread>
 #include <vector>
 
+#include <android/binder_manager.h>
 #include "hwc_buffer_allocator.h"
 #include "hwc_session.h"
 #include "hwc_debugger.h"
+#include <processgroup/processgroup.h>
+#include <system/graphics.h>
 
 #define __CLASS__ "HWCSession"
 
@@ -52,6 +55,13 @@
 #define HWC_UEVENT_DRM_EXT_HOTPLUG "mdss_mdp/drm/card"
 
 static sdm::HWCSession::HWCModuleMethods g_hwc_module_methods;
+
+#include <aidl/android/hardware/power/IPower.h>
+#include <aidl/google/hardware/power/extension/pixel/IPowerExt.h>
+
+using ::aidl::android::hardware::power::IPower;
+using ::aidl::google::hardware::power::extension::pixel::IPowerExt;
+using namespace std::chrono_literals;
 
 hwc_module_t HAL_MODULE_INFO_SYM = {
   .common = {
@@ -68,6 +78,291 @@ hwc_module_t HAL_MODULE_INFO_SYM = {
 };
 
 namespace sdm {
+
+constexpr float nsecsPerSec = std::chrono::nanoseconds(1s).count();
+constexpr int64_t nsecsIdleHintTimeout = std::chrono::nanoseconds(100ms).count();
+HWCSession::PowerHalHintWorker::PowerHalHintWorker()
+      : Worker("DisplayHints", HAL_PRIORITY_URGENT_DISPLAY),
+        mNeedUpdateRefreshRateHint(false),
+        mPrevRefreshRate(0),
+        mPendingPrevRefreshRate(0),
+        mIdleHintIsEnabled(false),
+        mIdleHintDeadlineTime(0),
+        mIdleHintSupportIsChecked(false),
+        mIdleHintIsSupported(false),
+        mPowerModeState(HWC2::PowerMode::Off),
+        mVsyncPeriod(16666666),
+        mPowerHalExtAidl(nullptr) {
+    InitWorker();
+}
+
+int32_t HWCSession::PowerHalHintWorker::connectPowerHalExt() {
+    if (mPowerHalExtAidl) {
+        return android::NO_ERROR;
+    }
+    const std::string kInstance = std::string(IPower::descriptor) + "/default";
+    ndk::SpAIBinder pwBinder = ndk::SpAIBinder(AServiceManager_getService(kInstance.c_str()));
+    ndk::SpAIBinder pwExtBinder;
+    AIBinder_getExtension(pwBinder.get(), pwExtBinder.getR());
+    mPowerHalExtAidl = IPowerExt::fromBinder(pwExtBinder);
+    if (!mPowerHalExtAidl) {
+        DLOGE("failed to connect power HAL extension");
+        return -EINVAL;
+    }
+    ALOGI("connect power HAL extension successfully");
+    return android::NO_ERROR;
+}
+
+int32_t HWCSession::PowerHalHintWorker::checkPowerHalExtHintSupport(const std::string &mode) {
+    if (mode.empty() || connectPowerHalExt() != android::NO_ERROR) {
+        return -EINVAL;
+    }
+    bool isSupported = false;
+    auto ret = mPowerHalExtAidl->isModeSupported(mode.c_str(), &isSupported);
+    if (!ret.isOk()) {
+        DLOGE("failed to check power HAL extension hint: mode=%s", mode.c_str());
+        if (ret.getExceptionCode() == EX_TRANSACTION_FAILED) {
+            /*
+             * PowerHAL service may crash due to some reasons, this could end up
+             * binder transaction failure. Set nullptr here to trigger re-connection.
+             */
+            DLOGE("binder transaction failed for power HAL extension hint");
+            mPowerHalExtAidl = nullptr;
+            return -ENOTCONN;
+        }
+        return -EINVAL;
+    }
+    if (!isSupported) {
+        DLOGW("power HAL extension hint is not supported: mode=%s", mode.c_str());
+        return -EOPNOTSUPP;
+    }
+    DLOGI("power HAL extension hint is supported: mode=%s", mode.c_str());
+    return android::NO_ERROR;
+}
+
+int32_t HWCSession::PowerHalHintWorker::sendPowerHalExtHint(const std::string &mode,
+                                                               bool enabled) {
+    if (mode.empty() || connectPowerHalExt() != android::NO_ERROR) {
+        return -EINVAL;
+    }
+    auto ret = mPowerHalExtAidl->setMode(mode.c_str(), enabled);
+    if (!ret.isOk()) {
+        DLOGE("failed to send power HAL extension hint: mode=%s, enabled=%d", mode.c_str(),
+              enabled);
+        if (ret.getExceptionCode() == EX_TRANSACTION_FAILED) {
+            /*
+             * PowerHAL service may crash due to some reasons, this could end up
+             * binder transaction failure. Set nullptr here to trigger re-connection.
+             */
+            DLOGE("binder transaction failed for power HAL extension hint");
+            mPowerHalExtAidl = nullptr;
+            return -ENOTCONN;
+        }
+        return -EINVAL;
+    }
+    return android::NO_ERROR;
+}
+
+int32_t HWCSession::PowerHalHintWorker::checkRefreshRateHintSupport(int refreshRate) {
+    int32_t ret = android::NO_ERROR;
+    const auto its = mRefreshRateHintSupportMap.find(refreshRate);
+    if (its == mRefreshRateHintSupportMap.end()) {
+        /* check new hint */
+        std::string refreshRateHintStr = "REFRESH_" + std::to_string(refreshRate) + "FPS";
+        ret = checkPowerHalExtHintSupport(refreshRateHintStr);
+        if (ret == android::NO_ERROR || ret == -EOPNOTSUPP) {
+            mRefreshRateHintSupportMap[refreshRate] = (ret == android::NO_ERROR);
+            DLOGI("cache refresh rate hint %s: %d", refreshRateHintStr.c_str(), !ret);
+        } else {
+            DLOGE("failed to check the support of refresh rate hint, ret %d", ret);
+        }
+    } else {
+        /* check existing hint */
+        if (!its->second) {
+            ret = -EOPNOTSUPP;
+        }
+    }
+    return ret;
+}
+
+int32_t HWCSession::PowerHalHintWorker::sendRefreshRateHint(int refreshRate, bool enabled) {
+    std::string hintStr = "REFRESH_" + std::to_string(refreshRate) + "FPS";
+    int32_t ret = sendPowerHalExtHint(hintStr, enabled);
+    if (ret == -ENOTCONN) {
+        /* Reset the hints when binder failure occurs */
+        mPrevRefreshRate = 0;
+        mPendingPrevRefreshRate = 0;
+    }
+    return ret;
+}
+
+int32_t HWCSession::PowerHalHintWorker::updateRefreshRateHintInternal(
+        HWC2::PowerMode powerMode, uint32_t vsyncPeriod) {
+    int32_t ret = android::NO_ERROR;
+    /* We should disable pending hint before other operations */
+    if (mPendingPrevRefreshRate) {
+        ret = sendRefreshRateHint(mPendingPrevRefreshRate, false);
+        if (ret == android::NO_ERROR) {
+            mPendingPrevRefreshRate = 0;
+        } else {
+            return ret;
+        }
+    }
+    if (powerMode != HWC2::PowerMode::On) {
+        if (mPrevRefreshRate) {
+            ret = sendRefreshRateHint(mPrevRefreshRate, false);
+            // DLOGI("RefreshRate hint = %d disabled", mPrevRefreshRate);
+            if (ret == android::NO_ERROR) {
+                mPrevRefreshRate = 0;
+            }
+        }
+        return ret;
+    }
+    /* TODO: add refresh rate buckets, tracked in b/181100731 */
+    int refreshRate = static_cast<int>(round(nsecsPerSec / vsyncPeriod * 0.1f) * 10);
+    if (mPrevRefreshRate == refreshRate) {
+        return android::NO_ERROR;
+    }
+    ret = checkRefreshRateHintSupport(refreshRate);
+    if (ret != android::NO_ERROR) {
+        return ret;
+    }
+    /*
+     * According to PowerHAL design, while switching to next refresh rate, we
+     * have to enable the next hint first, then disable the previous one so
+     * that the next hint can take effect.
+     */
+    ret = sendRefreshRateHint(refreshRate, true);
+    // DLOGI("RefreshRate hint = %d enabled", refreshRate);
+    if (ret != android::NO_ERROR) {
+        return ret;
+    }
+    if (mPrevRefreshRate) {
+        ret = sendRefreshRateHint(mPrevRefreshRate, false);
+        if (ret != android::NO_ERROR) {
+            if (ret != -ENOTCONN) {
+                /*
+                 * We may fail to disable the previous hint and end up multiple
+                 * hints enabled. Save the failed hint as pending hint here, we
+                 * will try to disable it first while entering this function.
+                 */
+                mPendingPrevRefreshRate = mPrevRefreshRate;
+                mPrevRefreshRate = refreshRate;
+            }
+            return ret;
+        }
+    }
+    mPrevRefreshRate = refreshRate;
+    return ret;
+}
+
+int32_t HWCSession::PowerHalHintWorker::checkIdleHintSupport(void) {
+    int32_t ret = android::NO_ERROR;
+    Lock();
+    if (mIdleHintSupportIsChecked) {
+        ret = mIdleHintIsSupported ? android::NO_ERROR : -EOPNOTSUPP;
+        Unlock();
+        return ret;
+    }
+    Unlock();
+    ret = checkPowerHalExtHintSupport("DISPLAY_IDLE");
+    Lock();
+    if (ret == android::NO_ERROR) {
+        mIdleHintIsSupported = true;
+        mIdleHintSupportIsChecked = true;
+        DLOGI("display idle hint is supported");
+    } else if (ret == -EOPNOTSUPP) {
+        mIdleHintSupportIsChecked = true;
+        DLOGI("display idle hint is unsupported");
+    } else {
+        DLOGW("failed to check the support of display idle hint, ret %d", ret);
+    }
+    Unlock();
+    return ret;
+}
+
+int32_t HWCSession::PowerHalHintWorker::updateIdleHint(uint64_t deadlineTime) {
+    int32_t ret = checkIdleHintSupport();
+    if (ret != android::NO_ERROR) {
+        return ret;
+    }
+    bool enableIdleHint = (deadlineTime < systemTime(SYSTEM_TIME_MONOTONIC));
+
+    if (mIdleHintIsEnabled != enableIdleHint) {
+        // DLOGI("idle hint = %d", enableIdleHint);
+        ret = sendPowerHalExtHint("DISPLAY_IDLE", enableIdleHint);
+        if (ret == android::NO_ERROR) {
+            mIdleHintIsEnabled = enableIdleHint;
+        }
+    }
+    return ret;
+}
+
+void HWCSession::PowerHalHintWorker::signalRefreshRate(HWC2::PowerMode powerMode,
+                                                          uint32_t vsyncPeriod) {
+    Lock();
+    mPowerModeState = powerMode;
+    mVsyncPeriod = vsyncPeriod;
+    mNeedUpdateRefreshRateHint = true;
+    Unlock();
+    Signal();
+}
+
+void HWCSession::PowerHalHintWorker::signalIdle() {
+    Lock();
+    if (mIdleHintSupportIsChecked && !mIdleHintIsSupported) {
+        Unlock();
+        return;
+    }
+    mIdleHintDeadlineTime = static_cast<uint64_t>(systemTime(SYSTEM_TIME_MONOTONIC) + nsecsIdleHintTimeout);
+    Unlock();
+    Signal();
+}
+
+void HWCSession::PowerHalHintWorker::Routine() {
+    Lock();
+    int ret = android::NO_ERROR;
+    if (!mNeedUpdateRefreshRateHint) {
+        if (!mIdleHintIsSupported || mIdleHintIsEnabled) {
+            ret = WaitForSignalOrExitLocked();
+        } else {
+            uint64_t currentTime = static_cast<uint_t>(systemTime(SYSTEM_TIME_MONOTONIC));
+            if (mIdleHintDeadlineTime > currentTime) {
+                uint64_t timeout = mIdleHintDeadlineTime - currentTime;
+                ret = WaitForSignalOrExitLocked(static_cast<uint_t>(timeout));
+            }
+        }
+    }
+    if (ret == -EINTR) {
+        Unlock();
+        return;
+    }
+    bool needUpdateRefreshRateHint = mNeedUpdateRefreshRateHint;
+    uint64_t deadlineTime = mIdleHintDeadlineTime;
+    HWC2::PowerMode powerMode = mPowerModeState;
+    uint32_t vsyncPeriod = mVsyncPeriod;
+    /*
+     * Clear the flags here instead of clearing them after calling the hint
+     * update functions. The flags may be set by signals after Unlock() and
+     * before the hint update functions are done. Thus we may miss the newest
+     * hints if we clear the flags after the hint update functions work without
+     * errors.
+     */
+    mNeedUpdateRefreshRateHint = false;
+    Unlock();
+    updateIdleHint(deadlineTime);
+    if (needUpdateRefreshRateHint) {
+        int32_t rc = updateRefreshRateHintInternal(powerMode, vsyncPeriod);
+        if (rc != android::NO_ERROR && rc != -EOPNOTSUPP) {
+            Lock();
+            if (mPowerModeState == HWC2::PowerMode::On) {
+                /* Set the flag to trigger update again for next loop */
+                mNeedUpdateRefreshRateHint = true;
+            }
+            Unlock();
+        }
+    }
+}
 
 static HWCUEvent g_hwc_uevent_;
 Locker HWCSession::locker_[HWCCallbacks::kNumDisplays];
@@ -277,7 +572,7 @@ void HWCSession::InitSupportedDisplaySlots() {
   map_info_primary_.client_id = qdutils::DISPLAY_PRIMARY;
 
   if (null_display_mode_) {
-    // Skip display slot initialization.
+    InitSupportedNullDisplaySlots();
     return;
   }
 
@@ -363,6 +658,26 @@ void HWCSession::InitSupportedDisplaySlots() {
     DLOGI("Display Pairs: map.client_id: %d, start_index: %d", map.client_id, start_index);
     map_hwc_display_.insert(std::make_pair(map.client_id, start_index++));
   }
+}
+
+void HWCSession::InitSupportedNullDisplaySlots() {
+  if (!null_display_mode_) {
+    DLOGI("Should only be invoked during null display");
+    return;
+  }
+
+  map_info_primary_.client_id = 0;
+  // Resize HDR supported map to total number of displays
+  is_hdr_display_.resize(1);
+
+  if (!async_powermode_) {
+    return;
+  }
+
+  DLOGI("Display Pairs: map.client_id: %d, start_index: %d", INT32(map_info_primary_.client_id),
+                                                             HWCCallbacks::kNumRealDisplays);
+  map_hwc_display_.insert(std::make_pair(map_info_primary_.client_id,
+                                         HWCCallbacks::kNumRealDisplays));
 }
 
 int HWCSession::GetDisplayIndex(int dpy) {
@@ -488,6 +803,10 @@ int32_t HWCSession::CreateVirtualDisplay(hwc2_device_t *device, uint32_t width, 
 
   if (!out_display_id || !width || !height || !format) {
     return  HWC2_ERROR_BAD_PARAMETER;
+  }
+
+  if (null_display_mode_) {
+    return 0;
   }
 
   HWCSession *hwc_session = static_cast<HWCSession *>(device);
@@ -747,6 +1066,15 @@ int32_t HWCSession::PresentDisplay(hwc2_device_t *device, hwc2_display_t display
   auto status = HWC2::Error::BadDisplay;
   DTRACE_SCOPED();
 
+
+  thread_local bool setTaskProfileDone = false;
+  if (setTaskProfileDone == false) {
+        if (!SetTaskProfiles(gettid(), {"SFMainPolicy"})) {
+          DLOGW("Failed to add `%d` into SFMainPolicy", gettid());
+      }
+      setTaskProfileDone = true;
+  }
+
   if (!hwc_session || (display >= HWCCallbacks::kNumDisplays)) {
     DLOGW("Invalid Display : hwc session = %s display = %" PRIu64,
           hwc_session ? "Valid" : "NULL", display);
@@ -785,6 +1113,7 @@ int32_t HWCSession::PresentDisplay(hwc2_device_t *device, hwc2_display_t display
           hwc_session->callbacks_.ResetRefresh(display);
         }
         status = hwc_session->hwc_display_[display]->Present(out_retire_fence);
+        hwc_session->mPowerHalHint.signalIdle();
       }
     }
   }
@@ -858,12 +1187,14 @@ int32_t HWCSession::RegisterCallback(hwc2_device_t *device, int32_t descriptor,
     if (hwc_session->HandleBuiltInDisplays()) {
       DLOGW("Failed handling built-in displays.");
     }
-    DLOGI("Handling pluggable displays...");
-    int32_t err = hwc_session->HandlePluggableDisplays(false);
-    if (err) {
-      DLOGW("All displays could not be created. Error %d '%s'. Hotplug handling %s.", err,
-            strerror(abs(err)), hwc_session->hotplug_pending_event_ == kHotPlugEvent ? "deferred" :
-            "dropped");
+    if(!hwc_session->pluggable_is_primary_) {
+      DLOGI("Handling pluggable displays...");
+      int32_t err = hwc_session->HandlePluggableDisplays(false);
+      if (err) {
+        DLOGW("All displays could not be created. Error %d '%s'. Hotplug handling %s.", err,
+              strerror(abs(err)), hwc_session->hotplug_pending_event_ == kHotPlugEvent ? 
+              "deferred" : "dropped");
+      }
     }
 
     // If previously registered, call hotplug for all connected displays to refresh
@@ -1105,6 +1436,8 @@ int32_t HWCSession::SetPowerMode(hwc2_device_t *device, hwc2_display_t display, 
     // Reset the pending refresh bit
     hwc_session->pending_refresh_.reset(UINT32(display));
   }
+
+  hwc_session->updateRefreshRateHint();
 
   return HWC2_ERROR_NONE;
 }
@@ -2593,8 +2926,6 @@ int HWCSession::CreatePrimaryDisplay() {
     auto hwc_display = &hwc_display_[HWC_DISPLAY_PRIMARY];
     hwc2_display_t client_id = map_info_primary_.client_id;
 
-    DLOGI("Create primary display type = %d, sdm id = %d, client id = %d", info.display_type,
-                                                                    info.display_id, client_id);
     if (!info.is_connected && info.display_type == kPluggable) {
       pluggable_is_primary_ = true;
       null_display_active_ = true;
@@ -2616,8 +2947,9 @@ int HWCSession::CreatePrimaryDisplay() {
     }
 
     if (!status) {
+      DLOGI("Create primary display type = %d, sdm id = %d, client id = %d", info.display_type,
+                                                                    info.display_id, client_id);
       is_hdr_display_[UINT32(client_id)] = HasHDRSupport(*hwc_display);
-      DLOGI("Primary display created.");
       map_info_primary_.disp_type = info.display_type;
       map_info_primary_.sdm_id = info.display_id;
 
@@ -2627,7 +2959,7 @@ int HWCSession::CreatePrimaryDisplay() {
         DLOGW("Failed to load HWCColorManager.");
       }
     } else {
-      DLOGE("Primary display creation failed.");
+      DLOGE("Primary display creation has failed! status = %d", status);
     }
 
     // Primary display is found, no need to parse more.
@@ -2940,6 +3272,22 @@ bool HWCSession::HasHDRSupport(HWCDisplay *hwc_display) {
 }
 
 int HWCSession::HandleDisconnectedDisplays(HWDisplaysInfo *hw_displays_info) {
+  if (pluggable_is_primary_) {
+    bool disconnect = true;
+    DisplayMapInfo map_info = map_info_primary_;
+    for (auto &iter : *hw_displays_info) {
+      auto &info = iter.second;
+      if (info.display_id != map_info.sdm_id) {
+        continue;
+      }
+      if (info.is_connected) {
+        disconnect = false;
+      }
+    }
+    if (disconnect) {
+      DestroyDisplay(&map_info);
+    }
+  }
   // Destroy pluggable displays which were connected earlier but got disconnected now.
   for (auto &map_info : map_info_pluggable_) {
     bool disconnect = true;   // disconnect in case display id is not found in list.
@@ -3563,6 +3911,15 @@ void HWCSession::NotifyClientStatus(bool connected) {
     SCOPE_LOCK(locker_[i]);
     hwc_display_[i]->NotifyClientStatus(connected);
   }
+}
+
+void HWCSession::updateRefreshRateHint() {
+    uint_t mVsyncPeriod = static_cast<uint_t>(GetVsyncPeriod(HWC_DISPLAY_PRIMARY));
+    HWC2::PowerMode mPowerModeState = hwc_display_[HWC_DISPLAY_PRIMARY]->GetCurrentPowerMode();
+//    DLOGI("UpdateRefreshrate: powermode=%d, vSyncPeriod=%d", mPowerModeState, mVsyncPeriod);
+    if (mVsyncPeriod) {
+        mPowerHalHint.signalRefreshRate(mPowerModeState, mVsyncPeriod);
+    }
 }
 
 }  // namespace sdm
